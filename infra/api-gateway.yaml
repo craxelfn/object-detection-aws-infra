@@ -1,0 +1,83 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: API Gateway HTTP API for Object Detection Backend
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: detection-api
+
+Resources:
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${EnvironmentName}-api
+      ProtocolType: HTTP
+      Description: HTTPS proxy for Object Detection API
+      CorsConfiguration:
+        AllowOrigins:
+          - "https://car-nu-eight.vercel.app"
+          - "http://localhost:3000"
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        MaxAge: 300
+
+  HttpIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Sub
+        - http://${ElasticIP}:8000/{proxy}
+        - ElasticIP: !ImportValue
+            Fn::Sub: ${EnvironmentName}-ElasticIP
+      PayloadFormatVersion: "1.0"
+
+  ProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "ANY /{proxy+}"
+      Target: !Sub integrations/${HttpIntegration}
+
+  RootRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "ANY /"
+      Target: !Sub integrations/${RootIntegration}
+
+  RootIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Sub
+        - http://${ElasticIP}:8000
+        - ElasticIP: !ImportValue
+            Fn::Sub: ${EnvironmentName}-ElasticIP
+      PayloadFormatVersion: "1.0"
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway HTTPS endpoint URL
+    Value: !GetAtt HttpApi.ApiEndpoint
+    Export:
+      Name: !Sub ${EnvironmentName}-ApiGatewayEndpoint
+
+  HealthCheckURL:
+    Description: Health Check URL via API Gateway
+    Value: !Sub ${HttpApi.ApiEndpoint}/health

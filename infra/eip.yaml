@@ -1,0 +1,29 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Persistent Elastic IP for Object Detection API
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: detection-api
+
+Resources:
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-eip
+
+Outputs:
+  ElasticIPAddress:
+    Description: Public IP Address
+    Value: !Ref ElasticIP
+    Export:
+      Name: !Sub ${EnvironmentName}-ElasticIP
+
+  ElasticIPAllocationId:
+    Description: Allocation ID
+    Value: !GetAtt ElasticIP.AllocationId
+    Export:
+      Name: !Sub ${EnvironmentName}-ElasticIPAllocationId

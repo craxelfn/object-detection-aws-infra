@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EC2 Instance for Object Detection Backend
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: detection-api
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+
+  KeyPairName:
+    Type: String
+    Default: ''
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+
+Mappings:
+  RegionAMI:
+    eu-west-1:
+      AMI: ami-0d64bb532e0502c46
+
+Resources:
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ec2-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ec2-role
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${EnvironmentName}-ec2-profile
+      Roles:
+        - !Ref EC2Role
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !FindInMap [RegionAMI, !Ref 'AWS::Region', AMI]
+      SubnetId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-PublicSubnetId
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-EC2SecurityGroupId
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          exec > >(tee /var/log/user-data.log) 2>&1
+          
+          echo "Starting deployment..."
+          
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get upgrade -y
+          
+          apt-get install -y software-properties-common
+          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get update -y
+          apt-get install -y python3.11 python3.11-venv python3.11-dev python3-pip git libgl1 libglib2.0-0
+          
+          mkdir -p /opt/detection-api
+          cd /opt/detection-api
+          
+          cat > main.py << 'MAINPY'
+          """
+          Object Detection API - FastAPI + YOLOv8
+          """
+          
+          from fastapi import FastAPI, HTTPException
+          from fastapi.middleware.cors import CORSMiddleware
+          from pydantic import BaseModel
+          import numpy as np
+          from PIL import Image
+          import base64
+          import io
+          from typing import List
+          from ultralytics import YOLO
+          
+          app = FastAPI(title="Object Detection API")
+          
+          app.add_middleware(
+              CORSMiddleware,
+              allow_origins=[
+                  "http://localhost:3000",
+                  "http://127.0.0.1:3000",
+                  "https://car-nu-eight.vercel.app"
+              ],
+              allow_credentials=True,
+              allow_methods=["*"],
+              allow_headers=["*"],
+          )
+          
+          model = None
+          
+          class DetectionRequest(BaseModel):
+              imageData: str
+              width: int
+              height: int
+          
+          class Detection(BaseModel):
+              class_name: str
+              score: float
+              bbox: List[float]
+          
+          class DetectionResponse(BaseModel):
+              success: bool
+              predictions: List[Detection]
+          
+          @app.on_event("startup")
+          async def load_model():
+              global model
+              print("Loading model...")
+              model = YOLO("yolov8s.pt")
+              print("Model ready")
+          
+          @app.get("/health")
+          async def health_check():
+              return {"status": "healthy", "model_loaded": model is not None, "model_type": "YOLOv8s"}
+          
+          @app.post("/detect", response_model=DetectionResponse)
+          async def detect_objects(request: DetectionRequest):
+              global model
+              
+              if model is None:
+                  raise HTTPException(status_code=503, detail="Model not loaded")
+              
+              try:
+                  image_bytes = base64.b64decode(request.imageData)
+                  image = Image.open(io.BytesIO(image_bytes))
+                  
+                  if image.mode != 'RGB':
+                      image = image.convert('RGB')
+                  
+                  image_np = np.array(image)
+                  results = model(image_np, conf=0.4, verbose=False)
+                  
+                  predictions = []
+                  
+                  for result in results:
+                      boxes = result.boxes
+                      if boxes is not None:
+                          for i in range(len(boxes)):
+                              box = boxes.xyxy[i].cpu().numpy()
+                              x1, y1, x2, y2 = box
+                              
+                              box_width = x2 - x1
+                              box_height = y2 - y1
+                              
+                              scale_x = request.width / image_np.shape[1]
+                              scale_y = request.height / image_np.shape[0]
+                              
+                              bbox = [
+                                  float(x1 * scale_x),
+                                  float(y1 * scale_y),
+                                  float(box_width * scale_x),
+                                  float(box_height * scale_y)
+                              ]
+                              
+                              cls_id = int(boxes.cls[i].cpu().numpy())
+                              confidence = float(boxes.conf[i].cpu().numpy())
+                              class_name = model.names[cls_id]
+                              
+                              predictions.append(Detection(
+                                  class_name=class_name,
+                                  score=confidence,
+                                  bbox=bbox
+                              ))
+                  
+                  print(f"Detected {len(predictions)} objects")
+                  return DetectionResponse(success=True, predictions=predictions)
+                  
+              except Exception as e:
+                  print(f"Error: {e}")
+                  raise HTTPException(status_code=500, detail=str(e))
+          
+          if __name__ == "__main__":
+              import uvicorn
+              uvicorn.run(app, host="0.0.0.0", port=8000)
+          MAINPY
+          
+          cat > requirements.txt << 'REQS'
+          fastapi>=0.104.0
+          uvicorn>=0.24.0
+          python-multipart>=0.0.6
+          pillow>=10.0.0
+          numpy>=1.24.0
+          ultralytics>=8.0.0
+          REQS
+          
+          python3.11 -m venv /opt/detection-api/venv
+          source /opt/detection-api/venv/bin/activate
+          
+          pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          
+          cat > /etc/systemd/system/detection-api.service << 'SERVICE'
+          [Unit]
+          Description=Object Detection API
+          After=network.target
+          
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/opt/detection-api
+          ExecStart=/opt/detection-api/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000
+          Restart=always
+          RestartSec=10
+          StandardOutput=journal
+          StandardError=journal
+          
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+          
+          systemctl daemon-reload
+          systemctl enable detection-api
+          systemctl start detection-api
+          
+          echo "Deployment complete"
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ec2
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref EC2Instance
+      AllocationId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-ElasticIPAllocationId
+
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref EC2Instance
+
+  PublicIP:
+    Description: Public IP Address
+    Value: !ImportValue
+      Fn::Sub: ${EnvironmentName}-ElasticIP
+
+  APIEndpoint:
+    Description: API Endpoint URL
+    Value: !Sub
+      - http://${EIP}:8000
+      - EIP: !ImportValue
+          Fn::Sub: ${EnvironmentName}-ElasticIP
+
+  HealthCheckURL:
+    Description: Health Check URL
+    Value: !Sub
+      - http://${EIP}:8000/health
+      - EIP: !ImportValue
+          Fn::Sub: ${EnvironmentName}-ElasticIP
