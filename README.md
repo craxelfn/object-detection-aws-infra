@@ -2,6 +2,10 @@
 
 This folder contains a FastAPI server that runs TensorFlow object detection on a separate process, keeping the browser UI completely smooth.
 
+## Project Architecture
+
+![Project Architecture](./architecture/architecture.png)
+
 ## Setup
 
 1. Create a virtual environment:
